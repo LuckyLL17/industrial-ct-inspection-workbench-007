@@ -25,6 +25,38 @@ app.get('/api/scans/current', async () => scan);
 app.get('/api/scans/current/slice', async (request) => { const query = request.query as { axis?: string; index?: string }; return slice(query.axis ?? 'axial', Math.max(0, Math.min(95, Number(query.index ?? 42)))); });
 app.get('/api/workflow', async () => workflow);
 app.get('/api/annotations', async () => annotations);
+const AXES = ['axial', 'coronal', 'sagittal'];
+const KINDS = ['孔隙', '裂纹', '夹杂', '未熔合'];
+const SEVERITIES = ['低', '中', '高'];
+// 结构性字段：变化会使原复核结论失效，缺陷重新进入待处理；note 仅更新描述，保留复核状态
+const STRUCTURAL = ['axis', 'index', 'x', 'y', 'kind', 'severity', 'diameter'] as const;
+const validators: Record<string, (value: unknown) => boolean> = {
+  axis: value => AXES.includes(value as string),
+  index: value => Number.isInteger(value) && (value as number) >= 0 && (value as number) <= 95,
+  x: value => Number.isFinite(value) && (value as number) >= 0 && (value as number) <= 96,
+  y: value => Number.isFinite(value) && (value as number) >= 0 && (value as number) <= 96,
+  kind: value => KINDS.includes(value as string),
+  severity: value => SEVERITIES.includes(value as string),
+  diameter: value => Number.isFinite(value) && (value as number) > 0 && (value as number) <= 50,
+  note: value => typeof value === 'string' && value.length <= 500
+};
+app.patch('/api/annotations/:id', async (request, reply) => {
+  const id = (request.params as { id: string }).id;
+  const item = annotations.find(annotation => annotation.id === id);
+  if (!item) return reply.code(404).send({ ok: false, error: 'annotation_not_found' });
+  const body = (request.body ?? {}) as Record<string, unknown>;
+  const patch: Record<string, unknown> = {};
+  for (const [key, check] of Object.entries(validators)) {
+    if (body[key] === undefined) continue;
+    if (!check(body[key])) return reply.code(400).send({ ok: false, error: `invalid_${key}` });
+    patch[key] = body[key];
+  }
+  if (!Object.keys(patch).length) return reply.code(400).send({ ok: false, error: 'empty_patch' });
+  const reopened = STRUCTURAL.some(key => key in patch && patch[key] !== (item as unknown as Record<string, unknown>)[key]);
+  Object.assign(item, patch);
+  if (reopened) { item.reviewStatus = 'unreviewed'; delete item.reviewer; }
+  return { ...item, reopened };
+});
 app.post('/api/annotations', async (request) => { const body = request.body as Omit<Annotation, 'id' | 'createdAt' | 'confidence' | 'reviewStatus'>; const item: Annotation = { ...body, id: `D-${String(annotations.length + 32).padStart(3, '0')}`, confidence: +(0.62 + Math.random() * .34).toFixed(2), reviewStatus: 'unreviewed', createdAt: new Date().toISOString() }; annotations = [item, ...annotations]; return item; });
 app.post('/api/annotations/:id/review', async (request) => { const id = (request.params as { id: string }).id; const body = request.body as { status: ReviewStatus; reviewer?: string; note?: string }; const item = annotations.find(annotation => annotation.id === id); if (!item) return { ok: false, error: 'annotation_not_found' }; item.reviewStatus = body.status; item.reviewer = body.reviewer ?? '王工'; if (body.note) item.note = body.note; return item; });
 app.delete('/api/annotations/:id', async (request) => { const id = (request.params as { id: string }).id; annotations = annotations.filter(item => item.id !== id); return { ok: true }; });

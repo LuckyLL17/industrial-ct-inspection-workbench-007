@@ -4,7 +4,7 @@ const app = Fastify({ logger: true });
 await app.register(cors, { origin: true });
 
 type ReviewStatus = 'unreviewed' | 'in_review' | 'accepted' | 'rejected';
-type Annotation = { id: string; axis: string; index: number; x: number; y: number; kind: string; severity: string; note: string; diameter: number; confidence: number; reviewStatus: ReviewStatus; reviewer?: string; createdAt: string };
+type Annotation = { id: string; axis: string; index: number; x: number; y: number; kind: string; severity: string; note: string; diameter: number; confidence: number; reviewStatus: ReviewStatus; reviewer?: string; previousSeverity?: string; createdAt: string };
 const scan = { id: 'valve-housing-017', part: '液压阀体 / VH-017', material: 'AlSi10Mg', resolution: '42 μm', dimensions: '128 × 128 × 96 voxels', operator: '张工', acquiredAt: '2026-09-30 08:42', scanner: 'Phoenix v|tome|x M 300', lot: 'LOT-2026-09-A17', standard: 'ASTM E1441' };
 let annotations: Annotation[] = [
   { id: 'D-024', axis: 'axial', index: 42, x: 57, y: 39, kind: '孔隙', severity: '中', note: '疑似缩孔，建议复核', diameter: 1.86, confidence: .91, reviewStatus: 'in_review', reviewer: '王工', createdAt: '2026-09-30T09:12:00.000Z' },
@@ -26,9 +26,35 @@ app.get('/api/scans/current/slice', async (request) => { const query = request.q
 app.get('/api/workflow', async () => workflow);
 app.get('/api/annotations', async () => annotations);
 app.post('/api/annotations', async (request) => { const body = request.body as Omit<Annotation, 'id' | 'createdAt' | 'confidence' | 'reviewStatus'>; const item: Annotation = { ...body, id: `D-${String(annotations.length + 32).padStart(3, '0')}`, confidence: +(0.62 + Math.random() * .34).toFixed(2), reviewStatus: 'unreviewed', createdAt: new Date().toISOString() }; annotations = [item, ...annotations]; return item; });
-app.post('/api/annotations/:id/review', async (request) => { const id = (request.params as { id: string }).id; const body = request.body as { status: ReviewStatus; reviewer?: string; note?: string }; const item = annotations.find(annotation => annotation.id === id); if (!item) return { ok: false, error: 'annotation_not_found' }; item.reviewStatus = body.status; item.reviewer = body.reviewer ?? '王工'; if (body.note) item.note = body.note; return item; });
+const AXES = ['axial', 'coronal', 'sagittal'];
+const KINDS = ['孔隙', '裂纹', '夹杂', '未熔合'];
+const SEVERITIES = ['低', '中', '高'];
+// 实质性字段：坐标、平面、类型、严重度、尺寸。变更后原复核结论失效，缺陷重新进入待复核；备注仅更新描述，不影响复核状态
+const SUBSTANTIVE_FIELDS = ['axis', 'index', 'x', 'y', 'kind', 'severity', 'diameter'] as const;
+app.patch('/api/annotations/:id', async (request, reply) => {
+  const id = (request.params as { id: string }).id;
+  const item = annotations.find(annotation => annotation.id === id);
+  if (!item) { reply.code(404); return { ok: false, error: 'annotation_not_found' }; }
+  const body = (request.body ?? {}) as Record<string, unknown>;
+  const invalid = (field: string) => { reply.code(400); return { ok: false, error: `invalid_${field}` }; };
+  const patch: Partial<Annotation> = {};
+  if (body.axis !== undefined) { if (typeof body.axis !== 'string' || !AXES.includes(body.axis)) return invalid('axis'); patch.axis = body.axis; }
+  if (body.index !== undefined) { if (typeof body.index !== 'number' || !Number.isInteger(body.index) || body.index < 0 || body.index > 95) return invalid('index'); patch.index = body.index; }
+  if (body.x !== undefined) { if (typeof body.x !== 'number' || !(body.x >= 0 && body.x <= 96)) return invalid('x'); patch.x = body.x; }
+  if (body.y !== undefined) { if (typeof body.y !== 'number' || !(body.y >= 0 && body.y <= 96)) return invalid('y'); patch.y = body.y; }
+  if (body.kind !== undefined) { if (typeof body.kind !== 'string' || !KINDS.includes(body.kind)) return invalid('kind'); patch.kind = body.kind; }
+  if (body.severity !== undefined) { if (typeof body.severity !== 'string' || !SEVERITIES.includes(body.severity)) return invalid('severity'); patch.severity = body.severity; }
+  if (body.diameter !== undefined) { if (typeof body.diameter !== 'number' || !(body.diameter >= 0.1 && body.diameter <= 50)) return invalid('diameter'); patch.diameter = body.diameter; }
+  if (body.note !== undefined) { if (typeof body.note !== 'string' || !body.note.trim() || body.note.length > 500) return invalid('note'); patch.note = body.note; }
+  const reopened = SUBSTANTIVE_FIELDS.some(field => patch[field] !== undefined && patch[field] !== item[field]);
+  if (patch.severity !== undefined && patch.severity !== item.severity && item.severity === '高') item.previousSeverity = '高';
+  Object.assign(item, patch);
+  if (reopened) { item.reviewStatus = 'unreviewed'; delete item.reviewer; }
+  return { ...item, reopened };
+});
+app.post('/api/annotations/:id/review', async (request) => { const id = (request.params as { id: string }).id; const body = request.body as { status: ReviewStatus; reviewer?: string; note?: string }; const item = annotations.find(annotation => annotation.id === id); if (!item) return { ok: false, error: 'annotation_not_found' }; item.reviewStatus = body.status; item.reviewer = body.reviewer ?? '王工'; if (body.status === 'accepted' || body.status === 'rejected') delete item.previousSeverity; if (body.note) item.note = body.note; return item; });
 app.delete('/api/annotations/:id', async (request) => { const id = (request.params as { id: string }).id; annotations = annotations.filter(item => item.id !== id); return { ok: true }; });
 app.get('/api/measurements', async () => annotations.map(item => ({ annotationId: item.id, diameter: item.diameter, estimatedVolume: +(4 / 3 * Math.PI * (item.diameter / 2) ** 3).toFixed(2), aspectRatio: +(1.1 + item.diameter * .24).toFixed(2), tolerance: item.diameter > 2 ? '超出工艺关注阈值' : '在监控范围内' })));
 app.get('/api/compare', async () => ({ current: { scanId: scan.id, label: 'VH-017 / 本次扫描', defectCount: annotations.length, highRisk: annotations.filter(item => item.severity === '高').length }, previous: { scanId: 'valve-housing-016', label: 'VH-016 / 上一炉次', defectCount: 2, highRisk: 0 }, delta: { defectCount: annotations.length - 2, highRisk: annotations.filter(item => item.severity === '高').length } }));
-app.get('/api/report', async () => ({ scan, workflow, summary: stats(), annotations, releaseGate: annotations.some(item => item.severity === '高' && item.reviewStatus !== 'accepted') ? 'blocked' : 'ready' }));
+app.get('/api/report', async () => ({ scan, workflow, summary: stats(), annotations, releaseGate: annotations.some(item => (item.severity === '高' || item.previousSeverity === '高') && item.reviewStatus !== 'accepted') ? 'blocked' : 'ready' }));
 await app.listen({ port: 6182, host: '127.0.0.1' });
